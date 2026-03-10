@@ -1,0 +1,30 @@
+# ────────────────────────────────────────────
+# Chisel Pipeline Configuration
+# ────────────────────────────────────────────
+
+# ── Perception Layer ──────────────────────────
+feature_extractor: sift          # sift | superpoint
+feature_matcher: nn              # nn | lightglue
+max_keypoints: 4096
+match_ratio_threshold: 0.80
+use_depth_prior: false
+
+# ── Geometry Layer ────────────────────────────
+min_match_inliers: 30
+ransac_threshold: 3.0
+ba_max_iterations: 100
+ba_frequency: 5
+optimizer: ceres                 # ceres | gtsam
+
+# ── Reconstruction Layer ──────────────────────
+run_dense: true
+num_depth_samples: 128
+num_source_images: 5
+depth_confidence_threshold: 0.3
+voxel_size: 0.01                 # TSDF voxel size in meters
+
+# ── General ───────────────────────────────────
+max_image_dim: 1600
+device: auto                     # auto | cuda | cpu
+output_dir: ./output
+verbose: true
