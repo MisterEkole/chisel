@@ -13,6 +13,7 @@ data/
 *.7z
 *.zip
 *.tar.gz
+weights/
 
 # ==========================================
 # Python Caches & Environments
@@ -35,5 +36,13 @@ env/
 # ==========================================
 # IDE & OS specific files
 # ==========================================
+.cache/
 .vscode/
 .DS_Store
+.claude/
+eval_results.json
+eval_results.png
+pipeline_sfm_bugs.md
+bug_fix.md
+diagram.md
+vslam_architecture.md

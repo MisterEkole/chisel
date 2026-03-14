@@ -27,6 +27,7 @@ from .perception.feature_matcher import NNMatcher, LightGlueMatcher, MatchResult
 from .perception.depth_estimator import MonocularDepthEstimator
 from .eval.metrics import (
     evaluate_reconstruction, evaluate_poses, evaluate_depth,
+    align_trajectories_umeyama,
     ReconstructionMetrics, PoseMetrics, DepthMetrics,
 )
 
@@ -71,16 +72,26 @@ class PipelineConfig:
     max_keypoints: int = 4096
     match_ratio_threshold: float = 0.80
     use_depth_prior: bool = False
+    superpoint_weights: Optional[str] = None
+    lightglue_weights: Optional[str] = None
 
     # Pair selection
-    pair_window: int = 5                  # sequential matching window
+    pair_window: int = 4             # sequential matching window
 
     # Geometry
-    min_match_inliers: int = 30
+    min_match_inliers: int = 10
     ransac_threshold: float = 3.0
-    ba_max_iterations: int = 100
-    ba_frequency: int = 5
+    ba_max_iterations: int = 300         # periodic BA iterations
+    ba_final_iterations: int = 500       # final global BA gets more budget
+    ba_frequency: int = 3                # run BA every N new cameras (lower = more frequent)
     optimizer: str = "ceres"             # "ceres" | "gtsam"
+
+    # Geometry thresholds
+    min_triangulation_angle: float = 2.0    # degrees; filters near-degenerate points
+    pnp_reprojection_threshold: float = 2.0 # pixels; solvePnPRansac inlier threshold
+    min_pnp_inliers: int = 15               # minimum PnP inliers to accept a pose
+    max_reproj_for_triangulation: float = 4.0  # pixels; filter triangulated points
+    ba_outlier_threshold: float = 3.0       # pixels; cull 3D points above this after each BA
 
     # Reconstruction
     run_dense: bool = True
@@ -122,9 +133,13 @@ class PipelineResults:
     ba_mean_reproj_error: Optional[float] = None  # None = BA not run
 
     def summary(self) -> str:
-        ba_str = (f"{self.ba_mean_reproj_error:.3f} px"
-                  if self.ba_mean_reproj_error is not None
-                  else "n/a (C++ not built)")
+        if self.ba_mean_reproj_error is None:
+            ba_str = "n/a (need >2 registered cameras)"
+        elif isinstance(self.ba_mean_reproj_error, float) and (
+                self.ba_mean_reproj_error != self.ba_mean_reproj_error):  # NaN check
+            ba_str = "NaN (degenerate reconstruction)"
+        else:
+            ba_str = f"{self.ba_mean_reproj_error:.3f} px"
         lines = [
             "",
             "╔══════════════════════════════════════════════════╗",
@@ -209,14 +224,24 @@ class ReconstructionPipeline:
     # ------------------------------------------------------------------
 
     def _setup_modules(self):
+        # LightGlue is O(N²) per pair, but SfM requires enough keypoints so that
+        # the initial track is dense enough for PnP on neighbouring images.
+        # With 1024 kps the track has ~26 points / 1024 total = 2.5% density,
+        # giving ~1–3 2D-3D correspondences per neighbouring image — far below
+        # the PnP minimum of 6.  Using the full max_keypoints (default 4096)
+        # raises track density to ~15%, giving 15–20 correspondences.
+        # On a GPU each pair still runs in <1 s; CPU timing scales as O(N²).
+        sp_max_kp = self.cfg.max_keypoints  # no cap: let user control via --max-keypoints
         self.extractor = (
-            SuperPointExtractor(max_keypoints=self.cfg.max_keypoints,
+            SuperPointExtractor(max_keypoints=sp_max_kp,
+                                weights_path=self.cfg.superpoint_weights,
                                 device=self.cfg.device)
             if self.cfg.feature_extractor == "superpoint"
             else SIFTExtractor(max_keypoints=self.cfg.max_keypoints)
         )
         self.matcher = (
-            LightGlueMatcher(device=self.cfg.device)
+            LightGlueMatcher(weights_path=self.cfg.lightglue_weights,
+                             device=self.cfg.device)
             if self.cfg.feature_matcher == "lightglue"
             else NNMatcher(ratio_threshold=self.cfg.match_ratio_threshold,
                            ransac_threshold=self.cfg.ransac_threshold,
@@ -300,14 +325,30 @@ class ReconstructionPipeline:
 
         # Phase 4 — Evaluation
         print("\n── Phase 4: Evaluation ──")
+        sim3_R, sim3_s, sim3_t = None, None, None  # Umeyama Sim3 to GT frame
         if len(sfm.get("poses", {})) >= 3:
             results.pose_metrics = self._evaluate_poses(scene, sfm)
             if results.pose_metrics:
                 print(f"  Poses: {results.pose_metrics.summary()}")
+            # Compute Sim3 for point-cloud alignment (used in F1 eval below)
+            est_c, gt_c = [], []
+            for iid, (R, t) in sfm["poses"].items():
+                if iid in scene.images:
+                    est_c.append(-R.T @ t)
+                    gt_c.append(scene.images[iid].center)
+            if len(est_c) >= 3:
+                sim3_R, sim3_s, sim3_t = align_trajectories_umeyama(
+                    np.array(est_c), np.array(gt_c))
 
         gt_pts, _ = scene.load_gt_points()
         if len(gt_pts) > 0 and results.num_sparse_points > 0:
-            results.recon_metrics = evaluate_reconstruction(sfm["points3d"], gt_pts)
+            pts = sfm["points3d"]
+            # Align reconstruction to GT coordinate frame before computing F1.
+            # Without this, every estimated point is in an arbitrary frame and
+            # all distances to GT exceed max_dist → F1 = 0% unconditionally.
+            if sim3_R is not None:
+                pts = (sim3_s * (sim3_R @ pts.T).T) + sim3_t
+            results.recon_metrics = evaluate_reconstruction(pts, gt_pts)
             print(results.recon_metrics.summary())
 
         if self.depth_estimator is not None:
@@ -339,14 +380,22 @@ class ReconstructionPipeline:
     def _select_pairs(self, image_ids: List[int],
                       window: int) -> List[Tuple[int, int]]:
         """
-        Window-based sequential pair selection.
-        Images assumed captured in sorted ID order.
-        Complexity: O(n * window) vs O(n^2) exhaustive.
+        Pair selection: exhaustive for small scenes (≤60 images),
+        window-based otherwise.
+        Exhaustive on 38 images = 703 pairs ≈ 70s with LightGlue — tractable.
+        Window-based for large scenes: O(n * window) vs O(n^2).
         """
         pairs = []
-        for i, id1 in enumerate(image_ids):
-            for j in range(i + 1, min(i + 1 + window, len(image_ids))):
-                pairs.append((id1, image_ids[j]))
+        n = len(image_ids)
+        if n <= 60:
+            # Exhaustive: try every pair
+            for i in range(n):
+                for j in range(i + 1, n):
+                    pairs.append((image_ids[i], image_ids[j]))
+        else:
+            for i, id1 in enumerate(image_ids):
+                for j in range(i + 1, min(i + 1 + window, n)):
+                    pairs.append((id1, image_ids[j]))
         return pairs
 
     # ------------------------------------------------------------------
@@ -380,12 +429,48 @@ class ReconstructionPipeline:
         registered: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
         # ---- Two-view initialization ------------------------------------
-        # Sort candidate pairs by match count, then pick the one with the
-        # best triangulation baseline. A pair with many matches but a tiny
-        # baseline (near-duplicate frames) produces a near-empty track and
-        # makes every subsequent PnP fail.
-        sorted_pairs = sorted(matches.items(),
-                              key=lambda kv: kv[1].num_matches, reverse=True)
+        # Prefer the LARGEST connected component of the match graph.
+        # Choosing a pair from a small isolated cluster means only the images
+        # in that cluster can ever be registered — even if most of the scene
+        # is covered by a larger, well-connected cluster.
+        from collections import deque
+
+        # Build adjacency list from matched pairs
+        adj: Dict[int, set] = {}
+        for (a, b) in matches:
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+
+        # BFS to find connected components
+        def _bfs_component(start: int) -> set:
+            seen, q = {start}, deque([start])
+            while q:
+                n = q.popleft()
+                for nb in adj.get(n, []):
+                    if nb not in seen:
+                        seen.add(nb); q.append(nb)
+            return seen
+
+        visited: set = set()
+        components: List[set] = []
+        for node in adj:
+            if node not in visited:
+                c = _bfs_component(node)
+                components.append(c)
+                visited |= c
+        largest_cc = max(components, key=len) if components else set()
+        if self.cfg.verbose:
+            print(f"  Match graph: {len(adj)} images, "
+                  f"{len(components)} component(s), "
+                  f"largest={len(largest_cc)} images")
+
+        # Sort candidates: pairs inside the largest CC first, then by match count
+        def _pair_key(kv):
+            (a, b), mr = kv
+            in_lcc = int(a in largest_cc and b in largest_cc)
+            return (in_lcc, mr.num_matches)
+
+        sorted_pairs = sorted(matches.items(), key=_pair_key, reverse=True)
 
         id1, id2, init_mr = None, None, None
         R0, t0 = None, None
@@ -404,7 +489,7 @@ class ReconstructionPipeline:
             if Ec is None:
                 continue
             mEc = mEc.ravel().astype(bool)
-            if mEc.sum() < 30:
+            if mEc.sum() < 15:
                 continue
 
             cp1i, cp2i = cp1[mEc], cp2[mEc]
@@ -419,7 +504,10 @@ class ReconstructionPipeline:
             wc = h4c[3:4].copy(); wc[np.abs(wc) < 1e-10] = 1e-10
             xyz_c = (h4c[:3] / wc).T
 
-            # Compute median triangulation angle to check baseline quality
+            # Compute per-point triangulation angle.
+            # Points below min_triangulation_angle are excluded from the initial
+            # map (they cause BA divergence) but still counted for the pair's
+            # median angle so we can judge baseline quality.
             c1 = np.zeros(3)
             c2 = -Rc.T @ tc
             accepted, angles = [], []
@@ -430,7 +518,8 @@ class ReconstructionPipeline:
                 r2 = xyz - c2; r2 /= (np.linalg.norm(r2) + 1e-10)
                 angle = np.degrees(np.arccos(np.clip(r1 @ r2, -1, 1)))
                 angles.append(angle)
-                accepted.append((m, xyz))
+                if angle >= self.cfg.min_triangulation_angle:
+                    accepted.append((m, xyz))
 
             if len(angles) == 0:
                 continue
@@ -469,124 +558,245 @@ class ReconstructionPipeline:
         if self.cfg.verbose:
             print(f"  Init pair ({id1},{id2}): {len(pts3d)} points triangulated")
 
-        # ---- Incremental registration ------------------------------------
+        # ---- Multi-pass incremental registration -------------------------
+        # Each pass: try PnP for unregistered images, then retriangulate
+        # between ALL registered pairs to expand the track.  With a sparse
+        # init track, images adjacent to the init pair often fail in pass 1
+        # but succeed in pass 2 once retriangulation densifies the track.
         n_reg = 2
-        for nid in sorted(features.keys()):
-            if nid in registered:
-                continue
-
-            p2d, p3d, fi_list, pi_list = [], [], [], []
-            for rid in list(registered.keys()):
-                pk = (min(nid, rid), max(nid, rid))
-                if pk not in matches:
+        max_passes = 3
+        for sfm_pass in range(max_passes):
+            newly_registered = 0
+            for nid in sorted(features.keys()):
+                if nid in registered:
                     continue
-                mr = matches[pk]
-                for k in range(mr.num_matches):
-                    if pk[0] == nid:
-                        fi_n, fi_r = int(mr.matches[k, 0]), int(mr.matches[k, 1])
-                    else:
-                        fi_n, fi_r = int(mr.matches[k, 1]), int(mr.matches[k, 0])
-                    if (rid, fi_r) in track:
-                        pi = track[(rid, fi_r)]
-                        p2d.append(features[nid].keypoints[fi_n])
-                        p3d.append(pts3d[pi]["xyz"])
-                        fi_list.append(fi_n)
-                        pi_list.append(pi)
 
-            if len(p2d) < 6:
+                p2d, p3d, fi_list, pi_list = [], [], [], []
+                for rid in list(registered.keys()):
+                    pk = (min(nid, rid), max(nid, rid))
+                    if pk not in matches:
+                        continue
+                    mr = matches[pk]
+                    for k in range(mr.num_matches):
+                        if pk[0] == nid:
+                            fi_n, fi_r = int(mr.matches[k, 0]), int(mr.matches[k, 1])
+                        else:
+                            fi_n, fi_r = int(mr.matches[k, 1]), int(mr.matches[k, 0])
+                        if (rid, fi_r) in track:
+                            pi = track[(rid, fi_r)]
+                            p2d.append(features[nid].keypoints[fi_n])
+                            p3d.append(pts3d[pi]["xyz"])
+                            fi_list.append(fi_n)
+                            pi_list.append(pi)
+
+                if len(p2d) < 6:
+                    if self.cfg.verbose and sfm_pass == 0:
+                        print(f"  Skip [{nid}] {scene.images[nid].name}: "
+                              f"only {len(p2d)} 2D-3D correspondences (need ≥6)")
+                    continue
+
+                K_n = scene.cameras[scene.images[nid].camera_id].K
+                ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    np.array(p3d, dtype=np.float64),
+                    np.array(p2d, dtype=np.float32),
+                    K_n, None,
+                    iterationsCount=200,
+                    reprojectionError=self.cfg.pnp_reprojection_threshold,
+                    confidence=0.999, flags=cv2.SOLVEPNP_EPNP,
+                )
+                if not ok or inliers is None or len(inliers) < self.cfg.min_pnp_inliers:
+                    if self.cfg.verbose and sfm_pass == 0:
+                        n_inl = len(inliers) if inliers is not None else 0
+                        print(f"  Skip [{nid}] {scene.images[nid].name}: "
+                              f"PnP failed (ok={ok}, inliers={n_inl})")
+                    continue
+
+                R_n, _ = cv2.Rodrigues(rvec)
+                t_n = tvec.ravel()
+                registered[nid] = (R_n, t_n)
+                n_reg += 1
+                newly_registered += 1
+
+                for inl in inliers.ravel():
+                    track[(nid, fi_list[inl])] = pi_list[inl]
+
                 if self.cfg.verbose:
-                    print(f"  Skip [{nid}] {scene.images[nid].name}: "
-                          f"only {len(p2d)} 2D-3D correspondences (need ≥6)")
-                continue
+                    print(f"  [pass {sfm_pass+1}] Registered [{nid}] "
+                          f"{scene.images[nid].name}  "
+                          f"inliers={len(inliers)}  pts={len(pts3d)}")
 
-            K_n = scene.cameras[scene.images[nid].camera_id].K
-            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-                np.array(p3d, dtype=np.float64),
-                np.array(p2d, dtype=np.float32),
-                K_n, None,
-                iterationsCount=200, reprojectionError=4.0,
-                confidence=0.999, flags=cv2.SOLVEPNP_EPNP,
-            )
-            if not ok or inliers is None or len(inliers) < 6:
-                if self.cfg.verbose:
-                    n_inl = len(inliers) if inliers is not None else 0
-                    print(f"  Skip [{nid}] {scene.images[nid].name}: "
-                          f"PnP failed (ok={ok}, inliers={n_inl})")
-                continue
+                # Triangulate new points with all registered cameras
+                for rid in list(registered.keys()):
+                    if rid == nid:
+                        continue
+                    pk = (min(nid, rid), max(nid, rid))
+                    if pk not in matches or matches[pk].num_matches < 8:
+                        continue
 
-            R_n, _ = cv2.Rodrigues(rvec)
-            t_n = tvec.ravel()
-            registered[nid] = (R_n, t_n)
-            n_reg += 1
+                    R_r, t_r = registered[rid]
+                    K_r = scene.cameras[scene.images[rid].camera_id].K
+                    Pn = K_n @ np.hstack([R_n, t_n.reshape(3, 1)])
+                    Pr = K_r @ np.hstack([R_r, t_r.reshape(3, 1)])
 
-            for inl in inliers.ravel():
-                track[(nid, fi_list[inl])] = pi_list[inl]
+                    mr = matches[pk]
+                    new_pairs = []
+                    for k in range(mr.num_matches):
+                        if pk[0] == nid:
+                            fn, fr = int(mr.matches[k, 0]), int(mr.matches[k, 1])
+                        else:
+                            fn, fr = int(mr.matches[k, 1]), int(mr.matches[k, 0])
+                        if (nid, fn) not in track and (rid, fr) not in track:
+                            new_pairs.append((fn, fr))
 
-            if self.cfg.verbose:
-                print(f"  Registered [{nid}] {scene.images[nid].name}  "
-                      f"inliers={len(inliers)}  pts={len(pts3d)}")
+                    if len(new_pairs) < 5:
+                        continue
 
-            # Triangulate new points with all registered cameras
-            for rid in list(registered.keys()):
-                if rid == nid:
+                    an = np.array([features[nid].keypoints[p[0]] for p in new_pairs],
+                                  dtype=np.float32)
+                    ar = np.array([features[rid].keypoints[p[1]] for p in new_pairs],
+                                  dtype=np.float32)
+                    h4n = cv2.triangulatePoints(Pn, Pr, an.T, ar.T)
+                    wn = h4n[3:4]; wn[np.abs(wn) < 1e-10] = 1e-10
+                    new_xyz = (h4n[:3] / wn).T
+
+                    c_n = -R_n.T @ t_n
+                    c_r = -R_r.T @ t_r
+                    max_e = self.cfg.max_reproj_for_triangulation
+                    for (fn, fr), xyz in zip(new_pairs, new_xyz):
+                        if not np.all(np.isfinite(xyz)):
+                            continue
+                        pt_n = R_n @ xyz + t_n
+                        pt_r = R_r @ xyz + t_r
+                        if pt_n[2] <= 0 or pt_r[2] <= 0:
+                            continue
+                        r1 = xyz - c_n; r1 /= (np.linalg.norm(r1) + 1e-10)
+                        r2 = xyz - c_r; r2 /= (np.linalg.norm(r2) + 1e-10)
+                        if np.degrees(np.arccos(np.clip(r1 @ r2, -1, 1))) < self.cfg.min_triangulation_angle:
+                            continue
+                        # Reprojection error filter
+                        e_n = np.linalg.norm((K_n @ pt_n)[:2] / pt_n[2] - features[nid].keypoints[fn])
+                        e_r = np.linalg.norm((K_r @ pt_r)[:2] / pt_r[2] - features[rid].keypoints[fr])
+                        if e_n > max_e or e_r > max_e:
+                            continue
+                        pi = len(pts3d)
+                        pts3d.append({"xyz": xyz.copy()})
+                        track[(nid, fn)] = pi
+                        track[(rid, fr)] = pi
+
+                # Periodic BA
+                if n_reg % self.cfg.ba_frequency == 0:
+                    registered_pre = {k: (R.copy(), t.copy())
+                                      for k, (R, t) in registered.items()}
+                    registered, pts3d = self._bundle_adjust(
+                        registered, pts3d, track, features, scene,
+                        max_obs=2000, max_nfev=self.cfg.ba_max_iterations)
+                    # Revert any poses that went NaN (Ceres diverged on bad points)
+                    for iid in list(registered.keys()):
+                        R_out, t_out = registered[iid]
+                        if not (np.all(np.isfinite(R_out)) and
+                                np.all(np.isfinite(t_out))):
+                            registered[iid] = registered_pre[iid]
+                    # Mark NaN 3D points as invalid (skipped by _bundle_adjust pre-filter)
+                    for pt in pts3d:
+                        if not np.all(np.isfinite(pt["xyz"])):
+                            pt["xyz"] = np.full(3, np.nan)
+                    # Cull high-reproj outliers so they don't poison future BAs
+                    n_culled = self._cull_outlier_points(
+                        pts3d, track, registered, features, scene,
+                        max_reproj=self.cfg.ba_outlier_threshold)
+                    if self.cfg.verbose and n_culled:
+                        print(f"    [cull] {n_culled} outlier points removed "
+                              f"(>{self.cfg.ba_outlier_threshold:.1f}px)")
+
+            # After each pass: retriangulate between ALL registered pairs so
+            # that later passes see a denser track.
+            print(f"  [pass {sfm_pass+1}] {newly_registered} new cameras registered "
+                  f"({n_reg} total). Retriangulating…")
+            for (pid1, pid2), mr in matches.items():
+                if pid1 not in registered or pid2 not in registered:
                     continue
-                pk = (min(nid, rid), max(nid, rid))
-                if pk not in matches or matches[pk].num_matches < 8:
-                    continue
+                R_a, t_a = registered[pid1]
+                R_b, t_b = registered[pid2]
+                K_a = scene.cameras[scene.images[pid1].camera_id].K
+                K_b = scene.cameras[scene.images[pid2].camera_id].K
+                Pa = K_a @ np.hstack([R_a, t_a.reshape(3, 1)])
+                Pb = K_b @ np.hstack([R_b, t_b.reshape(3, 1)])
 
-                R_r, t_r = registered[rid]
-                K_r = scene.cameras[scene.images[rid].camera_id].K
-                Pn = K_n @ np.hstack([R_n, t_n.reshape(3, 1)])
-                Pr = K_r @ np.hstack([R_r, t_r.reshape(3, 1)])
-
-                mr = matches[pk]
                 new_pairs = []
                 for k in range(mr.num_matches):
-                    if pk[0] == nid:
-                        fn, fr = int(mr.matches[k, 0]), int(mr.matches[k, 1])
-                    else:
-                        fn, fr = int(mr.matches[k, 1]), int(mr.matches[k, 0])
-                    if (nid, fn) not in track and (rid, fr) not in track:
-                        new_pairs.append((fn, fr))
+                    fa, fb = int(mr.matches[k, 0]), int(mr.matches[k, 1])
+                    if (pid1, fa) not in track and (pid2, fb) not in track:
+                        new_pairs.append((fa, fb))
 
                 if len(new_pairs) < 5:
                     continue
 
-                an = np.array([features[nid].keypoints[p[0]] for p in new_pairs],
+                an = np.array([features[pid1].keypoints[p[0]] for p in new_pairs],
                               dtype=np.float32)
-                ar = np.array([features[rid].keypoints[p[1]] for p in new_pairs],
+                bn = np.array([features[pid2].keypoints[p[1]] for p in new_pairs],
                               dtype=np.float32)
-                h4n = cv2.triangulatePoints(Pn, Pr, an.T, ar.T)
-                wn = h4n[3:4]; wn[np.abs(wn) < 1e-10] = 1e-10
-                new_xyz = (h4n[:3] / wn).T
+                h4 = cv2.triangulatePoints(Pa, Pb, an.T, bn.T)
+                w4 = h4[3:4].copy(); w4[np.abs(w4) < 1e-10] = 1e-10
+                xyz_all = (h4[:3] / w4).T
 
-                for (fn, fr), xyz in zip(new_pairs, new_xyz):
-                    if (R_n @ xyz + t_n)[2] <= 0:
+                c_a = -R_a.T @ t_a
+                c_b = -R_b.T @ t_b
+                max_e = self.cfg.max_reproj_for_triangulation
+                for (fa, fb), xyz in zip(new_pairs, xyz_all):
+                    if not np.all(np.isfinite(xyz)):
                         continue
-                    if (R_r @ xyz + t_r)[2] <= 0:
+                    pt_a = R_a @ xyz + t_a
+                    pt_b = R_b @ xyz + t_b
+                    if pt_a[2] <= 0 or pt_b[2] <= 0:
+                        continue
+                    r1 = xyz - c_a; r1 /= (np.linalg.norm(r1) + 1e-10)
+                    r2 = xyz - c_b; r2 /= (np.linalg.norm(r2) + 1e-10)
+                    if np.degrees(np.arccos(np.clip(r1 @ r2, -1, 1))) < self.cfg.min_triangulation_angle:
+                        continue
+                    # Reprojection error filter
+                    e_a = np.linalg.norm((K_a @ pt_a)[:2] / pt_a[2] - features[pid1].keypoints[fa])
+                    e_b = np.linalg.norm((K_b @ pt_b)[:2] / pt_b[2] - features[pid2].keypoints[fb])
+                    if e_a > max_e or e_b > max_e:
                         continue
                     pi = len(pts3d)
                     pts3d.append({"xyz": xyz.copy()})
-                    track[(nid, fn)] = pi
-                    track[(rid, fr)] = pi
+                    track[(pid1, fa)] = pi
+                    track[(pid2, fb)] = pi
 
-            # Periodic BA
-            if n_reg % self.cfg.ba_frequency == 0:
-                registered, pts3d = self._bundle_adjust(
-                    registered, pts3d, track, features, scene,
-                    max_obs=2000, max_nfev=self.cfg.ba_max_iterations)
+            if self.cfg.verbose:
+                print(f"  After pass {sfm_pass+1} retriangulation: "
+                      f"{len(pts3d)} total points")
+
+            # Stop early if no progress was made this pass
+            if newly_registered == 0:
+                break
 
         # Final BA
         mean_err = None
         if n_reg > 2:
             print("  Running final bundle adjustment…")
+            registered_pre = {k: (R.copy(), t.copy())
+                              for k, (R, t) in registered.items()}
             registered, pts3d, mean_err = self._bundle_adjust(
                 registered, pts3d, track, features, scene,
-                max_obs=5000, max_nfev=self.cfg.ba_max_iterations,
+                max_obs=5000, max_nfev=self.cfg.ba_final_iterations,
                 return_cost=True)
+            for iid in list(registered.keys()):
+                R_out, t_out = registered[iid]
+                if not (np.all(np.isfinite(R_out)) and np.all(np.isfinite(t_out))):
+                    registered[iid] = registered_pre[iid]
+            if mean_err is not None and not np.isfinite(mean_err):
+                mean_err = None
+            # Final outlier cull with tighter threshold
+            n_culled = self._cull_outlier_points(
+                pts3d, track, registered, features, scene,
+                max_reproj=max(1.5, self.cfg.ba_outlier_threshold / 2.0))
+            if self.cfg.verbose and n_culled:
+                print(f"  [final cull] {n_culled} outlier points removed")
 
-        arr = (np.array([p["xyz"] for p in pts3d], dtype=np.float64)
-               if pts3d else np.zeros((0, 3)))
+        # Filter NaN/Inf points before building final array
+        valid_xyz = [p["xyz"] for p in pts3d if np.all(np.isfinite(p["xyz"]))]
+        arr = np.array(valid_xyz, dtype=np.float64) if valid_xyz else np.zeros((0, 3))
 
         return {"num_registered": len(registered), "num_points": len(arr),
                 "points3d": arr, "poses": registered,
@@ -596,6 +806,51 @@ class ReconstructionPipeline:
     # ------------------------------------------------------------------
     # Bundle Adjustment
     # ------------------------------------------------------------------
+
+    def _cull_outlier_points(self, pts3d, track, registered, features, scene,
+                             max_reproj: float = 3.0) -> int:
+        """Remove 3D points whose mean reprojection error exceeds max_reproj.
+
+        Also deletes their track entries so those features become available for
+        retriangulation in the next pass.  Returns the count of culled points.
+        """
+        pid_obs: Dict[int, list] = {}
+        for (iid, fidx), pid in track.items():
+            if iid in registered:
+                pid_obs.setdefault(pid, []).append((iid, fidx))
+
+        bad_pids: set = set()
+        for pid, obs in pid_obs.items():
+            xyz = pts3d[pid]["xyz"]
+            if not np.all(np.isfinite(xyz)):
+                bad_pids.add(pid)
+                continue
+            errors = []
+            for iid, fidx in obs:
+                R, t = registered[iid]
+                cam = scene.cameras[scene.images[iid].camera_id]
+                pt_c = R @ xyz + t
+                if pt_c[2] <= 0:
+                    continue  # behind camera — skip this observation
+                px = cam.fx * pt_c[0] / pt_c[2] + cam.cx
+                py = cam.fy * pt_c[1] / pt_c[2] + cam.cy
+                kp = features[iid].keypoints[fidx]
+                errors.append(float(np.sqrt((px - kp[0])**2 + (py - kp[1])**2)))
+            if not errors:
+                bad_pids.add(pid)  # no valid observations → cull
+            elif float(np.mean(errors)) > max_reproj:
+                bad_pids.add(pid)
+
+        if not bad_pids:
+            return 0
+
+        # Free track entries so features can be retriangulated
+        for k in [k for k, v in track.items() if v in bad_pids]:
+            del track[k]
+        for pid in bad_pids:
+            pts3d[pid]["xyz"] = np.full(3, np.nan)
+
+        return len(bad_pids)
 
     def _bundle_adjust(self, registered, pts3d, track, features, scene,
                            max_nfev=50, return_cost= False, max_obs=3000, **kwargs):
@@ -645,6 +900,7 @@ class ReconstructionPipeline:
         for pid, pt in enumerate(pts3d):
             obs = pt_obs.get(pid, [])
             if not obs: continue
+            if not np.all(np.isfinite(pt["xyz"])): continue  # skip NaN/Inf — causes Ceres Iterations:-2
             
             cpp_pt = self._cpp.Point3D()
             cpp_pt.id = int(pid)
@@ -706,9 +962,120 @@ class ReconstructionPipeline:
                 print(f"  [dense] C++ error ({e}) — using SGBM fallback")
         return self._dense_sgbm(scene, sfm, out)
 
-    def _dense_cpp(self, scene, sfm, out):
-        raise NotImplementedError(
-            "C++ dense MVS requires 'cmake --build' to complete first")
+    def _dense_cpp(self, scene: "ETH3DScene", sfm: dict, out: Path) -> np.ndarray:
+        """C++ plane-sweep MVS → depth fusion → point cloud.
+
+        Requires the pybind11 module to expose DenseStereoConfig,
+        compute_all_depth_maps, FusionConfig, and fuse_scene_depth_maps.
+        Raises AttributeError if the module was built without dense support.
+        """
+        cpp = self._cpp
+
+        # Verify the bindings include dense MVS symbols
+        for sym in ("DenseStereoConfig", "FusionConfig",
+                    "compute_all_depth_maps", "fuse_scene_depth_maps"):
+            if not hasattr(cpp, sym):
+                raise AttributeError(
+                    f"C++ module missing '{sym}' — rebuild with dense support "
+                    f"('cmake --build build')")
+
+        registered = sfm.get("poses", {})
+        if len(registered) < 2:
+            return np.zeros((0, 3))
+
+        # ── 1. Build C++ scene ──────────────────────────────────────────
+        cpp_scene = cpp.Scene()
+
+        # Camera intrinsics
+        for cid, cam in scene.cameras.items():
+            cpp_cam = cpp.CameraIntrinsics()
+            cpp_cam.id = int(cid)
+            cpp_cam.fx, cpp_cam.fy = float(cam.fx), float(cam.fy)
+            cpp_cam.cx, cpp_cam.cy = float(cam.cx), float(cam.cy)
+            cpp_scene.cameras[int(cid)] = cpp_cam
+
+        # Images: pose + pixel data
+        for iid, (R, t) in registered.items():
+            cpp_img = cpp.Image()
+            cpp_img.id = int(iid)
+            cpp_img.camera_id = int(scene.images[iid].camera_id)
+            cpp_img.name = scene.images[iid].name
+
+            pose = cpp.CameraPose()
+            pose.R = np.asarray(R, dtype=np.float64)
+            pose.translation = np.asarray(t, dtype=np.float64)
+            cpp_img.pose = pose
+            cpp_img.pose_valid = True
+
+            # Load pixels — scene.get_image returns BGR numpy uint8
+            img_bgr = scene.get_image(iid)
+            if img_bgr is not None:
+                cpp_img.set_image(np.ascontiguousarray(img_bgr, dtype=np.uint8))
+
+            cpp_scene.images[int(iid)] = cpp_img
+
+        # ── 2. Estimate depth range from sparse point cloud ─────────────
+        sparse_pts = sfm.get("points3d", np.zeros((0, 3)))
+        min_depth, max_depth = 0.1, 100.0
+        if len(sparse_pts) > 5:
+            depths_all = []
+            for iid, (R, t) in registered.items():
+                pts_c = (R @ sparse_pts.T).T + t
+                valid_z = pts_c[:, 2]
+                valid_z = valid_z[valid_z > 0]
+                if len(valid_z) > 0:
+                    depths_all.extend(valid_z.tolist())
+            if len(depths_all) > 10:
+                min_depth = float(max(0.01, np.percentile(depths_all, 2)))
+                max_depth = float(np.percentile(depths_all, 98) * 1.5)
+
+        if self.cfg.verbose:
+            print(f"  [dense] depth range: [{min_depth:.3f}, {max_depth:.3f}] "
+                  f"({len(registered)} cameras)")
+
+        # ── 3. Dense stereo config ───────────────────────────────────────
+        dense_cfg = cpp.DenseStereoConfig()
+        dense_cfg.min_depth          = float(min_depth)
+        dense_cfg.max_depth          = float(max_depth)
+        dense_cfg.num_depth_samples  = int(self.cfg.num_depth_samples)
+        dense_cfg.num_source_images  = int(self.cfg.num_source_images)
+        dense_cfg.confidence_threshold = float(self.cfg.depth_confidence_threshold)
+        dense_cfg.filter_by_consistency = True  # consistency filter too aggressive with few cameras
+
+        # ── 4. Compute all depth maps ────────────────────────────────────
+        cpp.compute_all_depth_maps(cpp_scene, dense_cfg)
+
+        n_depth_maps = len(cpp_scene.depth_maps)
+        if self.cfg.verbose:
+            print(f"  [dense] {n_depth_maps} depth maps computed")
+
+        if n_depth_maps == 0:
+            print("  [dense] No depth maps produced — images may not be loaded")
+            return np.zeros((0, 3))
+
+        # ── 5. Fuse depth maps → point cloud ─────────────────────────────
+        fusion_cfg = cpp.FusionConfig()
+        fusion_cfg.min_confidence = float(self.cfg.depth_confidence_threshold)
+        fusion_cfg.depth_max      = float(max_depth)
+        fusion_cfg.subsample      = 2   # skip every other pixel to keep size manageable
+
+        pts_arr, col_arr = cpp.fuse_scene_depth_maps(cpp_scene, fusion_cfg)
+        pts = np.asarray(pts_arr)
+        cols = np.asarray(col_arr)
+
+        if len(pts) == 0:
+            print("  [dense] Fusion produced no points")
+            return np.zeros((0, 3))
+
+        # Cap at 2M points
+        if len(pts) > 2_000_000:
+            sel = np.random.default_rng(0).choice(len(pts), 2_000_000, replace=False)
+            pts, cols = pts[sel], cols[sel]
+
+        # cols are [0,1] floats from the C++ code — convert to uint8 for PLY
+        cols_u8 = np.clip(cols * 255, 0, 255).astype(np.uint8)
+        _save_ply(out / "dense.ply", pts, cols_u8)
+        return pts
 
     def _dense_sgbm(self, scene: ETH3DScene, sfm: dict, out: Path) -> np.ndarray:
         """
@@ -722,16 +1089,28 @@ class ReconstructionPipeline:
         if len(registered) < 2:
             return np.zeros((0, 3))
 
-        # Find pair with largest camera-center baseline
+        # Find the consecutive registered pair with baseline in a useful range
+        # for dense stereo: not too small (no parallax), not too large (SGBM
+        # window matching breaks down with wide-baseline, small overlap).
         ids = sorted(registered.keys())
-        id1, id2, best_bl = ids[0], ids[1], 0.0
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                Ri, ti = registered[ids[i]]
-                Rj, tj = registered[ids[j]]
-                bl = float(np.linalg.norm((-Ri.T @ ti) - (-Rj.T @ tj)))
-                if bl > best_bl:
-                    best_bl, id1, id2 = bl, ids[i], ids[j]
+        centers = {i: -registered[i][0].T @ registered[i][1] for i in ids}
+
+        # Compute all consecutive-pair baselines and pick the median-ish one
+        consec = [(ids[k], ids[k+1]) for k in range(len(ids)-1)]
+        pair_bl = [(a, b, float(np.linalg.norm(centers[a] - centers[b])))
+                   for a, b in consec]
+        pair_bl.sort(key=lambda x: x[2])
+
+        # Target: a pair whose baseline is between 5% and 30% of the scene span
+        all_bls = [x[2] for x in pair_bl]
+        scene_span = max(all_bls) if all_bls else 1.0
+        lo, hi = scene_span * 0.05, scene_span * 0.30
+        good = [(a, b, bl) for a, b, bl in pair_bl if lo <= bl <= hi]
+        if not good:
+            good = pair_bl  # fallback: use all consecutive pairs
+        # Among valid pairs pick the one with best (middle) baseline
+        mid = good[len(good) // 2]
+        id1, id2, best_bl = mid
 
         img1 = scene.get_image(id1)
         img2 = scene.get_image(id2)
@@ -780,9 +1159,24 @@ class ReconstructionPipeline:
         pts = pts_map[valid].reshape(-1, 3)
         cols = rect1[valid].reshape(-1, 3)
 
-        max_d = max(best_bl * 200.0, 50.0)
+        # Estimate scene depth range from sparse points visible in id1
+        sparse_pts = sfm.get("points3d", np.zeros((0, 3)))
+        if len(sparse_pts) > 0:
+            R1, t1_ = registered[id1]
+            pts_c = (R1 @ sparse_pts.T).T + t1_
+            valid_z = pts_c[:, 2]
+            valid_z = valid_z[valid_z > 0]
+            if len(valid_z) > 5:
+                min_d = float(np.percentile(valid_z, 5))
+                max_d = float(np.percentile(valid_z, 95)) * 2.0
+            else:
+                max_d = max(best_bl * 200.0, 50.0)
+                min_d = best_bl * 0.5
+        else:
+            max_d = max(best_bl * 200.0, 50.0)
+            min_d = 0.0
         keep = (np.all(np.isfinite(pts), axis=1)
-                & (pts[:, 2] > 0) & (pts[:, 2] < max_d))
+                & (pts[:, 2] > min_d) & (pts[:, 2] < max_d))
         pts, cols = pts[keep], cols[keep]
 
         if len(pts) == 0:

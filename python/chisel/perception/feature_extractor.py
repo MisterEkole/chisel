@@ -162,11 +162,37 @@ class SuperPointExtractor:
 
         if weights_path and Path(weights_path).exists():
             state = torch.load(weights_path, map_location=self.device)
+            state = self._remap_state_dict(state)
             self.model.load_state_dict(state)
             print(f"[perception] Loaded SuperPoint weights from {weights_path}")
         else:
             print("[perception] SuperPoint initialized with random weights "
                   "(provide pretrained weights for production use)")
+
+    @staticmethod
+    def _remap_state_dict(state: dict) -> dict:
+        """
+        Remap MagicLeap pretrained keys to our nested module structure.
+
+        Pretrained layout          →  SuperPointNet layout
+        conv1a … conv4b            →  encoder.conv1a … encoder.conv4b
+        convPa, convPb             →  detector.conv,   detector.out
+        convDa, convDb             →  descriptor.conv, descriptor.out
+        """
+        key_map = {
+            "conv1a": "encoder.conv1a", "conv1b": "encoder.conv1b",
+            "conv2a": "encoder.conv2a", "conv2b": "encoder.conv2b",
+            "conv3a": "encoder.conv3a", "conv3b": "encoder.conv3b",
+            "conv4a": "encoder.conv4a", "conv4b": "encoder.conv4b",
+            "convPa": "detector.conv",  "convPb": "detector.out",
+            "convDa": "descriptor.conv","convDb": "descriptor.out",
+        }
+        remapped = {}
+        for k, v in state.items():
+            prefix = k.split(".")[0]
+            suffix = k[len(prefix):]          # e.g. ".weight"
+            remapped[key_map.get(prefix, prefix) + suffix] = v
+        return remapped
 
     def _preprocess(self, image: np.ndarray) -> torch.Tensor:
         """Convert BGR image → (1, 1, H, W) normalized grayscale tensor."""

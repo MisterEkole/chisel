@@ -157,6 +157,15 @@ def align_trajectories_umeyama(
 
     Returns: (R, s, t)
     """
+    # Drop rows where either trajectory has NaN/Inf 
+    valid = (np.all(np.isfinite(estimated), axis=1) &
+             np.all(np.isfinite(ground_truth), axis=1))
+    if valid.sum() < 3:
+        # Degenerate: not enough valid poses to fit a Sim3.
+        return np.eye(3), 1.0, np.zeros(3)
+    estimated   = estimated[valid]
+    ground_truth = ground_truth[valid]
+
     n = estimated.shape[0]
 
     mu_est = estimated.mean(axis=0)
@@ -166,6 +175,10 @@ def align_trajectories_umeyama(
     gt_centered = ground_truth - mu_gt
 
     sigma_est = np.sum(est_centered ** 2) / n
+    if sigma_est < 1e-10:
+        # All estimated centers are coincident — can't determine scale/rotation.
+        return np.eye(3), 1.0, mu_gt - mu_est
+
     cov = gt_centered.T @ est_centered / n
 
     U, S, Vt = np.linalg.svd(cov)

@@ -52,8 +52,29 @@ def parse_args():
                         choices=["ceres", "gtsam"])
     parser.add_argument("--max-dim", type=int, default=1600)
     parser.add_argument("--max-keypoints", type=int, default=4096)
+    parser.add_argument("--min-tri-angle", type=float, default=2.0,
+                        help="Min triangulation angle in degrees (default: 2.0)")
+    parser.add_argument("--pnp-threshold", type=float, default=2.0,
+                        help="PnP RANSAC reprojection threshold in pixels (default: 2.0)")
+    parser.add_argument("--min-pnp-inliers", type=int, default=15,
+                        help="Min PnP inliers to accept a pose (default: 15)")
+    parser.add_argument("--max-reproj-tri", type=float, default=4.0,
+                        help="Max reprojection error for triangulated points in pixels (default: 4.0)")
+    parser.add_argument("--ratio-threshold", type=float, default=0.75,
+                        help="NN ratio test threshold (default: 0.75, SIFT+NN only)")
+    parser.add_argument("--ba-outlier-threshold", type=float, default=3.0,
+                        help="Cull 3D points above this reproj error after each BA (default: 3.0px)")
+    parser.add_argument("--ba-max-iterations", type=int, default=300,
+                        help="Max iterations for periodic bundle adjustment (default: 300)")
+    parser.add_argument("--ba-final-iterations", type=int, default=500,
+                        help="Max iterations for final global bundle adjustment (default: 500)")
+    parser.add_argument("--ba-frequency", type=int, default=3,
+                        help="Run periodic BA every N registered cameras (default: 3)")
     parser.add_argument("--no-dense", action="store_true")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--weights-dir", type=str, default=None,
+                        help="Directory containing superpoint_v1.pth and "
+                             "superpoint_lightglue.pth (default: weights/)")
 
     # Output
     parser.add_argument("--output", type=str, default="./output")
@@ -68,6 +89,11 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Resolve weights paths
+    weights_dir = Path(args.weights_dir) if args.weights_dir else Path("weights")
+    sp_weights = str(weights_dir / "superpoint_v1.pth")
+    lg_weights = str(weights_dir / "superpoint_lightglue.pth")
+
     # Build config
     config = PipelineConfig(
         feature_extractor=args.extractor,
@@ -79,6 +105,17 @@ def main():
         device=args.device,
         output_dir=args.output,
         verbose=args.verbose,
+        superpoint_weights=sp_weights if Path(sp_weights).exists() else None,
+        lightglue_weights=lg_weights if Path(lg_weights).exists() else None,
+        min_triangulation_angle=args.min_tri_angle,
+        pnp_reprojection_threshold=args.pnp_threshold,
+        min_pnp_inliers=args.min_pnp_inliers,
+        max_reproj_for_triangulation=args.max_reproj_tri,
+        match_ratio_threshold=args.ratio_threshold,
+        ba_max_iterations=args.ba_max_iterations,
+        ba_final_iterations=args.ba_final_iterations,
+        ba_frequency=args.ba_frequency,
+        ba_outlier_threshold=args.ba_outlier_threshold,
     )
 
     # Load YAML config if provided
