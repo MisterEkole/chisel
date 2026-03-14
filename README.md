@@ -7,7 +7,6 @@ End-to-end pipeline: feature extraction → matching → SfM → dense reconstru
 </p>
 
 
-
 ---
 
 ## Technical Overview
@@ -37,7 +36,7 @@ Geometry-intensive operations (bundle adjustment, dense stereo, depth fusion) ar
 | Component | Language | Dependencies |
 |-----------|----------|-------------|
 | Feature extraction | Python / PyTorch | OpenCV, PyTorch |
-| Feature matching | Python / PyTorch | PyTorch, SciPy |
+| Feature matching | Python / PyTorch | PyTorch, OpenCV |
 | Incremental SfM | Python + C++ BA | OpenCV, Ceres |
 | Dense MVS | C++ | OpenCV, Eigen |
 | Depth fusion / TSDF | C++ | OpenCV, Eigen |
