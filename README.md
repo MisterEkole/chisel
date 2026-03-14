@@ -6,10 +6,7 @@ End-to-end pipeline: feature extraction → matching → SfM → dense reconstru
   <img src="docs/assets/pipeline_overview.png" alt="Chisel Pipeline Overview" width="700"/>
 </p>
 
-```
-Perception (Python/PyTorch)  →  Geometry & Reconstruction (C++/Ceres/GTSAM)
-         └──────────────── pybind11 bridge ─────────────────┘
-```
+
 
 ---
 
