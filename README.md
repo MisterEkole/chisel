@@ -2,10 +2,100 @@
 
 End-to-end pipeline: feature extraction → matching → SfM → dense reconstruction, evaluated on [ETH3D](https://www.eth3d.net/).
 
+<p align="center">
+  <img src="docs/assets/pipeline_overview.png" alt="Chisel Pipeline Overview" width="700"/>
+</p>
+
 ```
 Perception (Python/PyTorch)  →  Geometry & Reconstruction (C++/Ceres/GTSAM)
          └──────────────── pybind11 bridge ─────────────────┘
 ```
+
+---
+
+## Technical Overview
+
+Chisel is a modular multi-view 3D reconstruction system that combines classical and learned feature processing with a compiled C++ geometry backend. The pipeline has five sequential phases, each configurable independently:
+
+**Phase 1 — Feature Extraction.** Keypoints and descriptors are extracted per image using either SIFT (OpenCV, 128-D descriptors) or SuperPoint (PyTorch, 256-D descriptors). Both produce a `FeatureData` object containing pixel coordinates, descriptor vectors, and detection scores. See [SuperPoint Architecture](#superpoint-architecture) below.
+
+**Phase 2 — Feature Matching.** Putative correspondences are established between image pairs using either nearest-neighbour matching with Lowe's ratio test or a learned LightGlue attention matcher. Both strategies end with fundamental-matrix RANSAC to filter geometrically inconsistent matches. See [LightGlue Architecture](#lightglue-architecture) below.
+
+**Phase 3 — Incremental SfM.** A two-view initialisation bootstraps the map from the best-connected image pair (essential matrix decomposition with cheirality check). Remaining images are registered incrementally via EPnP+RANSAC, interleaved with multi-view triangulation and Ceres-based bundle adjustment. BA minimises Huber-robust reprojection error with SPARSE_SCHUR factorisation; camera rotations are parameterised as unit quaternions with an EigenQuaternionManifold constraint. Post-BA outlier culling removes points with high mean reprojection error.
+
+**Phase 4 — Dense MVS.** Depth maps are computed via plane-sweep stereo with NCC cost across D=128 inverse-depth hypotheses. Source views are selected by a baseline-angle heuristic. Valid depth pixels are back-projected to world coordinates and fused into a dense coloured point cloud. An optional TSDF volume with Marching Cubes mesh extraction is supported.
+
+**Phase 5 — Evaluation.** Camera trajectories are aligned to ground truth via Umeyama Sim(3). Pose metrics (ATE RMSE, RPE) and point-cloud metrics (Accuracy, Completeness, F1 at τ ∈ {1, 2, 5, 10} cm) follow the ETH3D benchmark protocol.
+
+---
+
+## System Architecture
+
+Geometry-intensive operations (bundle adjustment, dense stereo, depth fusion) are implemented in C++17 and exposed to Python via pybind11 as the `_chisel_cpp` extension module. The Python layer handles orchestration, I/O, feature extraction (PyTorch), and evaluation.
+
+<p align="center">
+  <img src="docs/assets/architecture.png" alt="System Architecture" width="680"/>
+</p>
+
+| Component | Language | Dependencies |
+|-----------|----------|-------------|
+| Feature extraction | Python / PyTorch | OpenCV, PyTorch |
+| Feature matching | Python / PyTorch | PyTorch, SciPy |
+| Incremental SfM | Python + C++ BA | OpenCV, Ceres |
+| Dense MVS | C++ | OpenCV, Eigen |
+| Depth fusion / TSDF | C++ | OpenCV, Eigen |
+| Evaluation | Python | SciPy, NumPy |
+| Build system | CMake 3.18+ | pybind11, Ceres, GTSAM |
+
+---
+
+## SuperPoint Architecture
+
+SuperPoint (DeTone et al., CVPR 2018) is a self-supervised convolutional network that jointly detects interest points and computes dense descriptors in a single forward pass. Chisel implements the full architecture natively in PyTorch and remaps MagicLeap pretrained weights at load time.
+
+<p align="center">
+  <img src="docs/assets/superpoint_arch.png" alt="SuperPoint Architecture" width="660"/>
+</p>
+
+**Shared Encoder.** A VGG-style backbone with four convolutional blocks (two 3×3 convolutions + ReLU + 2×2 max-pool each). Channel progression: 1 → 64 → 64 → 128 → 128. After four pooling stages the spatial resolution is reduced by 8×, producing a shared feature tensor of shape `(128, H/8, W/8)`.
+
+**Detector Head.** Two convolutions (128 → 256 → 65) produce 65 channels: an 8×8 sub-pixel grid plus one dustbin channel. Channel-wise softmax converts logits to probabilities; the 64 non-dustbin channels are reshaped back to full resolution `(H, W)` by treating each 8×8 block as a sub-pixel grid. NMS (radius 4 px) and top-K selection produce the final keypoint set.
+
+**Descriptor Head.** Two convolutions (128 → 256 → 256) followed by L2-normalisation produce a semi-dense descriptor map at 1/8 resolution. Descriptors at keypoint locations are obtained by bicubic interpolation via `grid_sample`.
+
+---
+
+## LightGlue Architecture
+
+LightGlue (Lindenberger et al., ICCV 2023) is a Transformer-based learned matcher with L=9 alternating self-attention and cross-attention layers. It replaces the heuristic ratio test with a learned attention mechanism that jointly reasons about descriptor similarity and spatial layout.
+
+<p align="center">
+  <img src="docs/assets/lightglue_arch.png" alt="LightGlue Architecture" width="680"/>
+</p>
+
+**Rotary Positional Encoding.** A learned linear projection `Wᵣ ∈ ℝ^(head_dim/2 × 2)` maps normalised 2D keypoint coordinates to frequency vectors. Coordinates are centred and scaled by `max(H, W)/2` to preserve aspect ratio (critical for pretrained weight compatibility). Frequencies modulate Q and K inside self-attention via cos/sin rotation on even/odd dimension pairs.
+
+**Self-Attention (per-image).** Fused QKV projection (d_model → 3·d_model), split into 4 heads of dimension 64. RoPE applied to Q and K before scaled dot-product attention. Output passes through an FFN with residual: the FFN takes `cat([x, msg])` as input (2d → LayerNorm → GELU → d), gating how much attention signal to incorporate.
+
+**Cross-Attention (bidirectional).** Image 0 attends to Image 1 and vice versa simultaneously using a shared `to_qk` projection. Both directions use pre-update features for symmetric information flow. RoPE is not used here because the two images have independent coordinate frames.
+
+**Log Assignment + Match Extraction.** The final layer's assignment head produces `scores = r · proj(desc₀) · proj(desc₁)ᵀ + m₀ + m₁ᵀ` where `r` is a learned scalar and `m` are per-keypoint matchability logits. Mutual argmax on raw scores extracts matches; F-matrix RANSAC verification follows.
+
+---
+
+## Incremental SfM Loop
+
+<p align="center">
+  <img src="docs/assets/sfm_loop.png" alt="Incremental SfM" width="480"/>
+</p>
+
+---
+
+## Dense MVS Pipeline
+
+<p align="center">
+  <img src="docs/assets/mvs_pipeline.png" alt="Dense MVS" width="620"/>
+</p>
 
 ---
 
@@ -26,7 +116,7 @@ Perception (Python/PyTorch)  →  Geometry & Reconstruction (C++/Ceres/GTSAM)
 ### 1. Clone
 
 ```bash
-git clone <repo-url> chisel && cd chisel
+git clone https://github.com/MisterEkole/chisel.git && cd chisel
 ```
 
 ### 2. System dependencies
@@ -164,22 +254,11 @@ chisel/
 │   ├── data/                   # ETH3D dataset loader
 │   ├── eval/                   # Accuracy / completeness / F1 metrics
 │   └── pipeline.py             # Main orchestrator
+├── docs/assets/                # Architecture diagrams
 ├── scripts/                    # CLI entry points
 ├── weights/                    # Pretrained weights (after download)
 └── tests/                      # C++ (GTest) + Python (pytest) tests
 ```
-
----
-
-## Pipeline stages
-
-| Phase | Description |
-|-------|-------------|
-| **1 — Extraction** | Keypoints + descriptors per image (SIFT or SuperPoint) |
-| **2 — Matching** | Sequential window matching with ratio test + F-matrix RANSAC |
-| **3 — SfM** | Two-view init → incremental PnP registration → triangulation → bundle adjustment |
-| **4 — Dense** | PatchMatch MVS (C++) or SGBM stereo fallback (OpenCV) |
-| **5 — Evaluation** | ETH3D F1 score, ATE/RPE for camera poses |
 
 ---
 
