@@ -14,6 +14,7 @@ data/
 *.zip
 *.tar.gz
 weights/
+output/
 
 # ==========================================
 # Python Caches & Environments
