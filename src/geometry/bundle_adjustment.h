@@ -7,7 +7,7 @@ namespace geometry {
 
 struct BundleAdjustmentConfig {
     int    max_iterations     = 100;
-    double function_tolerance = 1e-6;
+    double function_tolerance = 1e-5;
     double gradient_tolerance = 1e-10;
     double parameter_tolerance = 1e-8;
 

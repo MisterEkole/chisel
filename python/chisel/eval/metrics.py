@@ -1,17 +1,4 @@
-"""
-chisel.eval.metrics
-~~~~~~~~~~~~~~~~~~~~
-Evaluation metrics for 3D reconstruction quality.
-
-Implements the ETH3D benchmark metrics:
-    - Accuracy: % of reconstructed points within threshold of GT
-    - Completeness: % of GT points within threshold of reconstruction
-    - F1 score: harmonic mean of accuracy and completeness
-
-Also provides:
-    - Pose evaluation (ATE, RPE)
-    - Depth map evaluation (abs_rel, sq_rel, RMSE, δ thresholds)
-"""
+"""chisel.eval.metrics — ETH3D reconstruction, pose, and depth evaluation metrics."""
 
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -60,17 +47,9 @@ def evaluate_reconstruction(
     recon_points: np.ndarray,      # (N, 3)
     gt_points: np.ndarray,         # (M, 3)
     thresholds_cm: List[float] = [1.0, 2.0, 5.0, 10.0],
-    max_dist: float = 1.0,        # meters, ignore points further than this
+    max_dist: float = 1.0,
 ) -> ReconstructionMetrics:
-    """
-    Evaluate reconstruction against ground truth using ETH3D metrics.
-
-    Args:
-        recon_points: Reconstructed point cloud (N, 3)
-        gt_points: Ground truth point cloud (M, 3)
-        thresholds_cm: Distance thresholds in centimeters
-        max_dist: Maximum distance to consider (meters)
-    """
+    """Evaluate reconstruction vs GT using ETH3D accuracy/completeness/F1 metrics."""
     if len(recon_points) == 0 or len(gt_points) == 0:
         return ReconstructionMetrics(
             thresholds=thresholds_cm,
@@ -151,17 +130,10 @@ def align_trajectories_umeyama(
     estimated: np.ndarray,  # (N, 3)
     ground_truth: np.ndarray,  # (N, 3)
 ) -> Tuple[np.ndarray, float, np.ndarray]:
-    """
-    Umeyama alignment: find s, R, t that minimizes
-    || GT - (s * R * Est + t) ||^2
-
-    Returns: (R, s, t)
-    """
-    # Drop rows where either trajectory has NaN/Inf 
+    """Umeyama Sim3 alignment: minimizes ||GT - (s·R·Est + t)||². Returns (R, s, t)."""
     valid = (np.all(np.isfinite(estimated), axis=1) &
              np.all(np.isfinite(ground_truth), axis=1))
     if valid.sum() < 3:
-        # Degenerate: not enough valid poses to fit a Sim3.
         return np.eye(3), 1.0, np.zeros(3)
     estimated   = estimated[valid]
     ground_truth = ground_truth[valid]
@@ -176,7 +148,6 @@ def align_trajectories_umeyama(
 
     sigma_est = np.sum(est_centered ** 2) / n
     if sigma_est < 1e-10:
-        # All estimated centers are coincident — can't determine scale/rotation.
         return np.eye(3), 1.0, mu_gt - mu_est
 
     cov = gt_centered.T @ est_centered / n
@@ -200,11 +171,7 @@ def evaluate_poses(
     estimated_rotations: Optional[np.ndarray] = None,  # (N, 3, 3)
     gt_rotations: Optional[np.ndarray] = None,         # (N, 3, 3)
 ) -> PoseMetrics:
-    """
-    Evaluate camera poses using ATE and RPE.
-
-    Performs Umeyama alignment before computing errors.
-    """
+    """Evaluate camera poses (ATE, RPE) with Umeyama alignment."""
     if len(estimated_centers) < 3 or len(gt_centers) < 3:
         return PoseMetrics()
 
@@ -212,7 +179,6 @@ def evaluate_poses(
     est = estimated_centers[:n]
     gt = gt_centers[:n]
 
-    # Align
     R, s, t = align_trajectories_umeyama(est, gt)
     est_aligned = (s * (R @ est.T).T) + t
 
@@ -226,14 +192,13 @@ def evaluate_poses(
         num_aligned=n,
     )
 
-    # RPE (if rotations provided)
+    # RPE
     if estimated_rotations is not None and gt_rotations is not None:
         n_rot = min(len(estimated_rotations), len(gt_rotations))
         rpe_rot_errors = []
         rpe_trans_errors = []
 
         for i in range(n_rot - 1):
-            # Relative transforms
             dR_est = estimated_rotations[i+1] @ estimated_rotations[i].T
             dR_gt = gt_rotations[i+1] @ gt_rotations[i].T
 

@@ -75,6 +75,8 @@ def parse_args():
     parser.add_argument("--weights-dir", type=str, default=None,
                         help="Directory containing superpoint_v1.pth and "
                              "superpoint_lightglue.pth (default: weights/)")
+    parser.add_argument("--min-match-inliers", type=int, default=30,
+                        help="Minimum inlier count for valid feature matching (default: 30")
 
     # Output
     parser.add_argument("--output", type=str, default="./output")
@@ -116,6 +118,7 @@ def main():
         ba_final_iterations=args.ba_final_iterations,
         ba_frequency=args.ba_frequency,
         ba_outlier_threshold=args.ba_outlier_threshold,
+        min_match_inliers=args.min_match_inliers,
     )
 
     # Load YAML config if provided

@@ -1,8 +1,4 @@
-"""
-chisel.utils.visualization
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Visualization utilities for features, matches, depth maps, and point clouds.
-"""
+"""chisel.utils.visualization — match, depth, and point cloud visualization."""
 
 import numpy as np
 import cv2
@@ -19,15 +15,7 @@ def visualize_matches(
     max_display: int = 100,
     output_path: Optional[str] = None,
 ) -> np.ndarray:
-    """
-    Draw feature matches between two images.
-
-    Args:
-        img1, img2: BGR images
-        kpts1, kpts2: (N, 2) keypoint coordinates
-        matches: (M, 2) index pairs
-        max_display: max matches to draw
-    """
+    """Draw feature matches side-by-side. Returns canvas image."""
     h1, w1 = img1.shape[:2]
     h2, w2 = img2.shape[:2]
 
@@ -65,21 +53,12 @@ def visualize_depth(
     colormap: int = cv2.COLORMAP_MAGMA,
     output_path: Optional[str] = None,
 ) -> np.ndarray:
-    """
-    Colorize a depth map for visualization.
-
-    Args:
-        depth: (H, W) depth map
-        min_depth, max_depth: depth range for normalization
-    """
-    # Clip and normalize
+    """Colorize depth map. Returns BGR image."""
     d = np.clip(depth, min_depth, max_depth)
     d_norm = (d - min_depth) / (max_depth - min_depth)
 
     # Invert so near=bright
     d_norm = 1.0 - d_norm
-
-    # Apply colormap
     d_uint8 = (d_norm * 255).astype(np.uint8)
     colored = cv2.applyColorMap(d_uint8, colormap)
 
@@ -98,13 +77,7 @@ def visualize_pointcloud(
     colors: Optional[np.ndarray] = None,
     output_path: str = "pointcloud.ply",
 ):
-    """
-    Save point cloud as PLY file for viewing in MeshLab/CloudCompare.
-
-    Args:
-        points: (N, 3) XYZ coordinates
-        colors: (N, 3) RGB colors in [0, 1] or [0, 255]
-    """
+    """Save point cloud as ASCII PLY."""
     n = len(points)
     has_color = colors is not None and len(colors) == n
 

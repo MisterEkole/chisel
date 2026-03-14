@@ -13,9 +13,7 @@
 #include "reconstruction/dense_stereo.h"
 #include "reconstruction/depth_fusion.h"
 
-// Make these map types opaque so Python gets a reference view, not a copy.
-// Without this, def_readwrite on std::map fields returns a Python dict copy
-// and writes from Python don't propagate back into the C++ object.
+// Opaque map types: Python gets reference view, not a dict copy.
 PYBIND11_MAKE_OPAQUE(std::map<chisel::ImageId,   chisel::ImageData>);
 PYBIND11_MAKE_OPAQUE(std::map<chisel::CameraId,  chisel::CameraIntrinsics>);
 PYBIND11_MAKE_OPAQUE(std::map<chisel::Point3DId, chisel::Point3D>);
@@ -27,7 +25,6 @@ using namespace chisel;
 PYBIND11_MODULE(_chisel_cpp, m) {
     m.doc() = "Chisel – C++ backend for 3D reconstruction";
 
-    // Bound map types — reference semantics so Python writes go into C++ objects
     py::bind_map<std::map<ImageId,   ImageData>>(m,       "ImageMap");
     py::bind_map<std::map<CameraId,  CameraIntrinsics>>(m,"CameraMap");
     py::bind_map<std::map<Point3DId, Point3D>>(m,         "PointMap");
@@ -53,7 +50,6 @@ PYBIND11_MODULE(_chisel_cpp, m) {
         )
         .def("matrix", &CameraPose::matrix);
 
-    // TrackElement is nested inside Point3D
     py::class_<Point3D::TrackElement>(m, "TrackElement")
         .def(py::init<>())
         .def(py::init<int, int>())
@@ -73,7 +69,7 @@ PYBIND11_MODULE(_chisel_cpp, m) {
         .def_readwrite("pose_valid", &chisel::ImageData::pose_valid)
         .def_readwrite("keypoints", &chisel::ImageData::keypoints)
         .def_readwrite("point3d_ids", &chisel::ImageData::point3d_ids)
-        // Set pixel data from a numpy H×W×C uint8 array (BGR, matching cv2.imread convention)
+        // Set pixel data from H×W×C uint8 numpy array (BGR)
         .def("set_image",
             [](chisel::ImageData& img,
                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> arr) {
@@ -149,9 +145,11 @@ PYBIND11_MODULE(_chisel_cpp, m) {
 
     py::class_<BundleAdjustmentConfig>(m, "BundleAdjustmentConfig")
         .def(py::init<>())
-        .def_readwrite("max_iterations", &BundleAdjustmentConfig::max_iterations)
-        .def_readwrite("verbose",        &BundleAdjustmentConfig::verbose)
-        .def_readwrite("huber_loss_scale",&geometry::BundleAdjustmentConfig::huber_loss_scale);
+        .def_readwrite("max_iterations",  &BundleAdjustmentConfig::max_iterations)
+        .def_readwrite("verbose",         &BundleAdjustmentConfig::verbose)
+        .def_readwrite("huber_loss_scale",&geometry::BundleAdjustmentConfig::huber_loss_scale)
+        .def_readwrite("fix_intrinsics",  &geometry::BundleAdjustmentConfig::fix_intrinsics)
+        .def_readwrite("fix_first_pose",  &geometry::BundleAdjustmentConfig::fix_first_pose);
 
     py::class_<BundleAdjustmentReport>(m, "BundleAdjustmentReport")
         .def_readonly("mean_reproj_error", &BundleAdjustmentReport::mean_reproj_error)

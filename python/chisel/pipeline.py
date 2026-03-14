@@ -1,16 +1,4 @@
-"""
-chisel.pipeline
-~~~~~~~~~~~~~~~~
-End-to-end 3D reconstruction pipeline.
-
-Orchestrates: perception → geometry → reconstruction → evaluation
-
-Usage:
-    from chisel.pipeline import ReconstructionPipeline
-
-    pipeline = ReconstructionPipeline(config)
-    results = pipeline.run("/path/to/eth3d/courtyard")
-"""
+"""chisel.pipeline — end-to-end 3D reconstruction pipeline."""
 
 import time
 import json
@@ -79,7 +67,7 @@ class PipelineConfig:
     pair_window: int = 4             # sequential matching window
 
     # Geometry
-    min_match_inliers: int = 10
+    min_match_inliers: int = 30
     ransac_threshold: float = 3.0
     ba_max_iterations: int = 300         # periodic BA iterations
     ba_final_iterations: int = 500       # final global BA gets more budget
@@ -224,14 +212,7 @@ class ReconstructionPipeline:
     # ------------------------------------------------------------------
 
     def _setup_modules(self):
-        # LightGlue is O(N²) per pair, but SfM requires enough keypoints so that
-        # the initial track is dense enough for PnP on neighbouring images.
-        # With 1024 kps the track has ~26 points / 1024 total = 2.5% density,
-        # giving ~1–3 2D-3D correspondences per neighbouring image — far below
-        # the PnP minimum of 6.  Using the full max_keypoints (default 4096)
-        # raises track density to ~15%, giving 15–20 correspondences.
-        # On a GPU each pair still runs in <1 s; CPU timing scales as O(N²).
-        sp_max_kp = self.cfg.max_keypoints  # no cap: let user control via --max-keypoints
+        sp_max_kp = self.cfg.max_keypoints
         self.extractor = (
             SuperPointExtractor(max_keypoints=sp_max_kp,
                                 weights_path=self.cfg.superpoint_weights,
@@ -379,12 +360,7 @@ class ReconstructionPipeline:
 
     def _select_pairs(self, image_ids: List[int],
                       window: int) -> List[Tuple[int, int]]:
-        """
-        Pair selection: exhaustive for small scenes (≤60 images),
-        window-based otherwise.
-        Exhaustive on 38 images = 703 pairs ≈ 70s with LightGlue — tractable.
-        Window-based for large scenes: O(n * window) vs O(n^2).
-        """
+        """Exhaustive for ≤60 images, window-based otherwise."""
         pairs = []
         n = len(image_ids)
         if n <= 60:
@@ -405,14 +381,7 @@ class ReconstructionPipeline:
     def _run_sfm(self, scene: ETH3DScene,
                  features: Dict[int, FeatureData],
                  matches: Dict[tuple, MatchResult]) -> dict:
-        """
-        Incremental SfM:
-          - Two-view init via essential matrix + triangulation
-          - PnP RANSAC registration for each new image
-          - Feature track maintenance
-          - New-point triangulation after each registration
-          - Periodic + final bundle adjustment
-        """
+        """Incremental SfM: two-view init → PnP registration → triangulation → BA."""
         import cv2
 
         _empty = {"num_registered": 0, "num_points": 0,
@@ -428,11 +397,7 @@ class ReconstructionPipeline:
         pts3d: List[Dict] = []          # [{'xyz': np.ndarray(3)}, ...]
         registered: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
-        # ---- Two-view initialization ------------------------------------
-        # Prefer the LARGEST connected component of the match graph.
-        # Choosing a pair from a small isolated cluster means only the images
-        # in that cluster can ever be registered — even if most of the scene
-        # is covered by a larger, well-connected cluster.
+        # ---- Two-view init: prefer largest match-graph component --------
         from collections import deque
 
         # Build adjacency list from matched pairs
@@ -504,10 +469,7 @@ class ReconstructionPipeline:
             wc = h4c[3:4].copy(); wc[np.abs(wc) < 1e-10] = 1e-10
             xyz_c = (h4c[:3] / wc).T
 
-            # Compute per-point triangulation angle.
-            # Points below min_triangulation_angle are excluded from the initial
-            # map (they cause BA divergence) but still counted for the pair's
-            # median angle so we can judge baseline quality.
+            # Per-point triangulation angle; exclude near-degenerate points.
             c1 = np.zeros(3)
             c2 = -Rc.T @ tc
             accepted, angles = [], []
@@ -558,11 +520,7 @@ class ReconstructionPipeline:
         if self.cfg.verbose:
             print(f"  Init pair ({id1},{id2}): {len(pts3d)} points triangulated")
 
-        # ---- Multi-pass incremental registration -------------------------
-        # Each pass: try PnP for unregistered images, then retriangulate
-        # between ALL registered pairs to expand the track.  With a sparse
-        # init track, images adjacent to the init pair often fail in pass 1
-        # but succeed in pass 2 once retriangulation densifies the track.
+        # ---- Multi-pass incremental registration ----
         n_reg = 2
         max_passes = 3
         for sfm_pass in range(max_passes):
@@ -809,11 +767,7 @@ class ReconstructionPipeline:
 
     def _cull_outlier_points(self, pts3d, track, registered, features, scene,
                              max_reproj: float = 3.0) -> int:
-        """Remove 3D points whose mean reprojection error exceeds max_reproj.
-
-        Also deletes their track entries so those features become available for
-        retriangulation in the next pass.  Returns the count of culled points.
-        """
+        """Remove high-reproj-error 3D points and their track entries. Returns count."""
         pid_obs: Dict[int, list] = {}
         for (iid, fidx), pid in track.items():
             if iid in registered:
@@ -864,7 +818,7 @@ class ReconstructionPipeline:
 
         cpp_scene = self._cpp.Scene()
 
-        # Sync Cameras (Intrinsics)
+        # Cameras
         for cid, cam in scene.cameras.items():
             cpp_cam = self._cpp.CameraIntrinsics()
             cpp_cam.id = int(cid)
@@ -872,20 +826,18 @@ class ReconstructionPipeline:
             cpp_cam.cx, cpp_cam.cy = float(cam.cx), float(cam.cy)
             cpp_scene.cameras[int(cid)] = cpp_cam
 
-        # Sync Images (Poses and Keypoints)
+        # Images
         for iid, (R, t) in registered.items():
             cpp_img = self._cpp.Image()
             cpp_img.id = int(iid)
             cpp_img.camera_id = int(scene.images[iid].camera_id)
             
-            # Use the C++ CameraPose property 'R' for automatic Quaternion conversion
             pose = self._cpp.CameraPose()
             pose.R = np.asarray(R, dtype=np.float64)
             pose.translation = np.asarray(t, dtype=np.float64)
             cpp_img.pose = pose
             cpp_img.pose_valid = True
             
-            # Convert keypoints to C++ list
             img_kps_arr = np.asarray(features[iid].keypoints, dtype=np.float64)
             #cpp_img.keypoints = [self._cpp.Keypoint(kp[:2]) for kp in img_kps_arr]
             kp_list = []
@@ -896,7 +848,7 @@ class ReconstructionPipeline:
             cpp_img.keypoints = kp_list
             cpp_scene.images[int(iid)] = cpp_img
 
-        # Sync 3D Points and Feature Tracks
+        # 3D points
         for pid, pt in enumerate(pts3d):
             obs = pt_obs.get(pid, [])
             if not obs: continue
@@ -906,12 +858,9 @@ class ReconstructionPipeline:
             cpp_pt.id = int(pid)
             cpp_pt.xyz = np.asarray(pt["xyz"], dtype=np.float64)
             
-            # Connect the "Elastic Bands" (Tracks)
             cpp_pt.track = [self._cpp.TrackElement(int(iid), int(fidx)) for iid, fidx in obs]
             cpp_scene.points3d[int(pid)] = cpp_pt
 
-        # DISPATCH: Choose the Optimizer based on CLI flag
-        # Defaults to ceres if not specified
         opt_choice = getattr(self.cfg, "optimizer", "ceres").lower()
         
         if opt_choice == "gtsam":
@@ -919,8 +868,7 @@ class ReconstructionPipeline:
             fg_cfg = self._cpp.FactorGraphConfig()
             fg_cfg.max_iterations = int(max_nfev)
             fg_cfg.verbose = bool(self.cfg.verbose)
-            # Tuning sigmas for ViT feature noise
-            fg_cfg.pixel_sigma = 1.2 
+            fg_cfg.pixel_sigma = 1.2
             fg_cfg.prior_rot_sigma = 1e-4
             
             report = self._cpp.optimize_full_graph(cpp_scene, fg_cfg)
@@ -931,6 +879,7 @@ class ReconstructionPipeline:
             ba_cfg.max_iterations = int(max_nfev)
             ba_cfg.verbose = bool(self.cfg.verbose)
             ba_cfg.huber_loss_scale = 1.0
+            ba_cfg.fix_intrinsics = True
             
             report = self._cpp.run_bundle_adjustment(cpp_scene, ba_cfg)
             final_error = report.mean_reproj_error
@@ -971,22 +920,18 @@ class ReconstructionPipeline:
         """
         cpp = self._cpp
 
-        # Verify the bindings include dense MVS symbols
         for sym in ("DenseStereoConfig", "FusionConfig",
                     "compute_all_depth_maps", "fuse_scene_depth_maps"):
             if not hasattr(cpp, sym):
-                raise AttributeError(
-                    f"C++ module missing '{sym}' — rebuild with dense support "
-                    f"('cmake --build build')")
+                raise AttributeError(f"C++ module missing '{sym}' — rebuild with dense support")
 
         registered = sfm.get("poses", {})
         if len(registered) < 2:
             return np.zeros((0, 3))
 
-        # ── 1. Build C++ scene ──────────────────────────────────────────
         cpp_scene = cpp.Scene()
 
-        # Camera intrinsics
+        # Cameras
         for cid, cam in scene.cameras.items():
             cpp_cam = cpp.CameraIntrinsics()
             cpp_cam.id = int(cid)
@@ -994,7 +939,7 @@ class ReconstructionPipeline:
             cpp_cam.cx, cpp_cam.cy = float(cam.cx), float(cam.cy)
             cpp_scene.cameras[int(cid)] = cpp_cam
 
-        # Images: pose + pixel data
+        # Images
         for iid, (R, t) in registered.items():
             cpp_img = cpp.Image()
             cpp_img.id = int(iid)
@@ -1007,14 +952,13 @@ class ReconstructionPipeline:
             cpp_img.pose = pose
             cpp_img.pose_valid = True
 
-            # Load pixels — scene.get_image returns BGR numpy uint8
             img_bgr = scene.get_image(iid)
             if img_bgr is not None:
                 cpp_img.set_image(np.ascontiguousarray(img_bgr, dtype=np.uint8))
 
             cpp_scene.images[int(iid)] = cpp_img
 
-        # ── 2. Estimate depth range from sparse point cloud ─────────────
+        # Depth range from sparse cloud
         sparse_pts = sfm.get("points3d", np.zeros((0, 3)))
         min_depth, max_depth = 0.1, 100.0
         if len(sparse_pts) > 5:
@@ -1033,16 +977,16 @@ class ReconstructionPipeline:
             print(f"  [dense] depth range: [{min_depth:.3f}, {max_depth:.3f}] "
                   f"({len(registered)} cameras)")
 
-        # ── 3. Dense stereo config ───────────────────────────────────────
+        # Dense stereo config
         dense_cfg = cpp.DenseStereoConfig()
         dense_cfg.min_depth          = float(min_depth)
         dense_cfg.max_depth          = float(max_depth)
         dense_cfg.num_depth_samples  = int(self.cfg.num_depth_samples)
         dense_cfg.num_source_images  = int(self.cfg.num_source_images)
         dense_cfg.confidence_threshold = float(self.cfg.depth_confidence_threshold)
-        dense_cfg.filter_by_consistency = True  # consistency filter too aggressive with few cameras
+        dense_cfg.filter_by_consistency = False
 
-        # ── 4. Compute all depth maps ────────────────────────────────────
+        # Compute depth maps
         cpp.compute_all_depth_maps(cpp_scene, dense_cfg)
 
         n_depth_maps = len(cpp_scene.depth_maps)
@@ -1053,11 +997,11 @@ class ReconstructionPipeline:
             print("  [dense] No depth maps produced — images may not be loaded")
             return np.zeros((0, 3))
 
-        # ── 5. Fuse depth maps → point cloud ─────────────────────────────
+        # Fuse depth maps
         fusion_cfg = cpp.FusionConfig()
         fusion_cfg.min_confidence = float(self.cfg.depth_confidence_threshold)
         fusion_cfg.depth_max      = float(max_depth)
-        fusion_cfg.subsample      = 2   # skip every other pixel to keep size manageable
+        fusion_cfg.subsample      = 2
 
         pts_arr, col_arr = cpp.fuse_scene_depth_maps(cpp_scene, fusion_cfg)
         pts = np.asarray(pts_arr)
@@ -1072,43 +1016,33 @@ class ReconstructionPipeline:
             sel = np.random.default_rng(0).choice(len(pts), 2_000_000, replace=False)
             pts, cols = pts[sel], cols[sel]
 
-        # cols are [0,1] floats from the C++ code — convert to uint8 for PLY
         cols_u8 = np.clip(cols * 255, 0, 255).astype(np.uint8)
         _save_ply(out / "dense.ply", pts, cols_u8)
         return pts
 
     def _dense_sgbm(self, scene: ETH3DScene, sfm: dict, out: Path) -> np.ndarray:
-        """
-        Dense stereo with OpenCV SGBM.
-        Selects the registered pair with the largest baseline,
-        rectifies, matches, reprojects, and saves dense.ply.
-        """
+        """OpenCV SGBM dense stereo: select pair, rectify, match, reproject."""
         import cv2
 
         registered = sfm.get("poses", {})
         if len(registered) < 2:
             return np.zeros((0, 3))
 
-        # Find the consecutive registered pair with baseline in a useful range
-        # for dense stereo: not too small (no parallax), not too large (SGBM
-        # window matching breaks down with wide-baseline, small overlap).
+        # Select consecutive pair with baseline in [5%, 30%] of scene span.
         ids = sorted(registered.keys())
         centers = {i: -registered[i][0].T @ registered[i][1] for i in ids}
 
-        # Compute all consecutive-pair baselines and pick the median-ish one
         consec = [(ids[k], ids[k+1]) for k in range(len(ids)-1)]
         pair_bl = [(a, b, float(np.linalg.norm(centers[a] - centers[b])))
                    for a, b in consec]
         pair_bl.sort(key=lambda x: x[2])
 
-        # Target: a pair whose baseline is between 5% and 30% of the scene span
         all_bls = [x[2] for x in pair_bl]
         scene_span = max(all_bls) if all_bls else 1.0
         lo, hi = scene_span * 0.05, scene_span * 0.30
         good = [(a, b, bl) for a, b, bl in pair_bl if lo <= bl <= hi]
         if not good:
             good = pair_bl  # fallback: use all consecutive pairs
-        # Among valid pairs pick the one with best (middle) baseline
         mid = good[len(good) // 2]
         id1, id2, best_bl = mid
 
@@ -1195,11 +1129,7 @@ class ReconstructionPipeline:
     # ------------------------------------------------------------------
 
     def _evaluate_depth(self, scene: ETH3DScene, sfm: dict) -> Optional[DepthMetrics]:
-        """
-        Evaluate monocular depth against ETH3D GT depth maps.
-        GT depth expected at <scene>/depth/<stem>.png  (16-bit PNG, mm).
-        Silently returns None if no GT depth directory exists.
-        """
+        """Evaluate monocular depth vs ETH3D GT (16-bit PNG, mm). Returns None if unavailable."""
         import cv2
 
         depth_dir = scene.path / "depth"

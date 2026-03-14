@@ -1,16 +1,17 @@
 {
   "scene_name": "courtyard",
   "num_images": 38,
-  "num_registered": 9,
-  "num_sparse_points": 0,
-  "num_dense_points": 2000000,
+  "num_registered": 25,
+  "num_sparse_points": 10173,
+  "num_dense_points": 0,
   "timing": {
-    "features": 4.500226974487305,
-    "matching": 677.2187550067902,
-    "sfm": 3.6258370876312256,
-    "dense": 714.199462890625,
-    "total": 1403.77658700943
+    "features": 4.65970516204834,
+    "matching": 90.12576413154602,
+    "sfm": 3.904719114303589,
+    "dense": 2098.948877096176,
+    "total": 2201.8435740470886
   },
-  "ba_mean_reproj_error": 0.621429021031977,
-  "pose_ate_rmse": 1.7047515389749104
+  "ba_mean_reproj_error": 1.324051697600317,
+  "pose_ate_rmse": 4.192719697535078,
+  "recon_mean_f1": 0.05551544677523586
 }

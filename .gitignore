@@ -43,7 +43,8 @@ env/
 .claude/
 eval_results.json
 eval_results.png
-pipeline_sfm_bugs.md
-bug_fix.md
-diagram.md
-vslam_architecture.md
+
+# Docs (keep README)
+*.md
+!README.md
+*.docx

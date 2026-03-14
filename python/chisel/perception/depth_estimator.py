@@ -1,9 +1,4 @@
-"""
-chisel.perception.depth_estimator
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Monocular depth estimation for initializing dense reconstruction.
-Uses a DPT/MiDaS-style encoder-decoder architecture.
-"""
+"""chisel.perception.depth_estimator — monocular depth (DPT/MiDaS-style encoder-decoder)."""
 
 import torch
 import torch.nn as nn
@@ -47,7 +42,7 @@ class SimpleDepthNet(nn.Module):
     def __init__(self, encoder_channels=(64, 128, 256, 512)):
         super().__init__()
 
-        # Encoder (simplified ResNet-style)
+        # Encoder
         c1, c2, c3, c4 = encoder_channels
 
         self.enc1 = nn.Sequential(
@@ -82,21 +77,16 @@ class SimpleDepthNet(nn.Module):
         self.dec2 = DepthDecoderBlock(c2, c2, c1)
         self.dec1 = DepthDecoderBlock(c1, c1, c1)
 
-        # Depth head (outputs inverse depth for numerical stability)
+        # Depth head
         self.depth_head = nn.Sequential(
             nn.Conv2d(c1, c1, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(c1, 1, 1),
-            nn.Sigmoid(),  # output in [0, 1] → scale to depth range
+            nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, 3, H, W) RGB images normalized to [0, 1]
-        Returns:
-            (B, 1, H, W) inverse depth map in [0, 1]
-        """
+        """x: (B, 3, H, W) RGB in [0,1]. Returns (B, 1, H, W) inverse depth."""
         # Encoder
         e1 = self.enc1(x)
         e2 = self.enc2(e1)
@@ -119,16 +109,7 @@ class SimpleDepthNet(nn.Module):
 
 
 class MonocularDepthEstimator:
-    """
-    Monocular depth estimation for initializing dense MVS.
-
-    Provides relative depth priors that help guide the dense matching
-    cost volume in the reconstruction layer.
-
-    Usage:
-        estimator = MonocularDepthEstimator()
-        depth, confidence = estimator.estimate(image_bgr)
-    """
+    """Monocular depth estimator for initializing dense MVS."""
 
     def __init__(
         self,
@@ -163,13 +144,12 @@ class MonocularDepthEstimator:
         import cv2
         H, W = image.shape[:2]
 
-        # Convert BGR → RGB and normalize
+        # BGR → RGB
         if len(image.shape) == 3:
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         else:
             rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
-        # Resize to target size
         resized = cv2.resize(rgb, (self.target_size[1], self.target_size[0]))
 
         tensor = torch.from_numpy(resized.astype(np.float32) / 255.0)
@@ -178,16 +158,7 @@ class MonocularDepthEstimator:
 
     @torch.no_grad()
     def estimate(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Estimate monocular depth from a single image.
-
-        Args:
-            image: (H, W, 3) BGR uint8 image
-
-        Returns:
-            depth: (H, W) depth map in meters
-            confidence: (H, W) confidence map in [0, 1]
-        """
+        """Estimate depth from BGR image. Returns (depth_m, confidence) arrays."""
         import cv2
 
         inp, orig_size = self._preprocess(image)
@@ -195,18 +166,16 @@ class MonocularDepthEstimator:
         inv_depth = self.model(inp)  # (1, 1, Ht, Wt) in [0, 1]
         inv_depth = inv_depth[0, 0].cpu().numpy()
 
-        # Convert inverse depth → metric depth
-        # inv_depth ∈ [0, 1] → depth ∈ [min_depth, max_depth]
+        # inv_depth → metric depth
         inv_min = 1.0 / self.max_depth
         inv_max = 1.0 / self.min_depth
         inv_depth_metric = inv_min + inv_depth * (inv_max - inv_min)
         depth = 1.0 / (inv_depth_metric + 1e-8)
 
-        # Resize back to original resolution
         depth = cv2.resize(depth, (orig_size[1], orig_size[0]),
                            interpolation=cv2.INTER_LINEAR)
 
-        # Simple confidence: based on gradient magnitude (edges = uncertain)
+        # Gradient-based confidence (edges = uncertain)
         grad_x = np.abs(np.gradient(depth, axis=1))
         grad_y = np.abs(np.gradient(depth, axis=0))
         grad_mag = np.sqrt(grad_x**2 + grad_y**2)

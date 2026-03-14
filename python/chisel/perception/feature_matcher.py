@@ -1,8 +1,4 @@
-"""
-chisel.perception.feature_matcher
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Feature matching: classical NN and learned (LightGlue-style) approaches.
-"""
+"""chisel.perception.feature_matcher — NN and LightGlue feature matching."""
 
 import torch
 import torch.nn as nn
@@ -155,8 +151,7 @@ class NNMatcher:
 # ─── Learned Matcher (LightGlue — ETH CVG architecture) ──────
 
 def _make_ffn(d_model: int) -> nn.Sequential:
-    """FFN called with cat([x, msg], dim=-1) as input (2*d_model → d_model).
-    Layout matches checkpoint indices: 0=Linear, 1=LayerNorm, 2=GELU, 3=Linear."""
+    """FFN: cat([x, msg]) (2*d_model) → d_model."""
     return nn.Sequential(
         nn.Linear(2 * d_model, 2 * d_model),
         nn.LayerNorm(2 * d_model),
@@ -166,11 +161,7 @@ def _make_ffn(d_model: int) -> nn.Sequential:
 
 
 def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply rotary positional encoding to Q or K.
-
-    x     : (B, H, N, head_dim)
-    freqs : (B, N, head_dim // 2)  — raw output of posenc.Wr(kpts)
-    """
+    """Apply rotary positional encoding to Q or K."""
     cos = torch.cos(freqs).unsqueeze(1)   # (B, 1, N, head_dim//2)
     sin = torch.sin(freqs).unsqueeze(1)
     x1, x2 = x[..., ::2], x[..., 1::2]  # split even / odd dims
@@ -180,10 +171,7 @@ def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 class RotaryPositionalEncoding(nn.Module):
-    """Learned rotary positional encoding.
-    Returns raw frequencies (B, N, head_dim//2); cos/sin applied inside attention.
-    Checkpoint key: posenc.Wr.weight  shape [head_dim//2, 2].
-    """
+    """Learned rotary positional encoding; cos/sin applied inside attention."""
 
     def __init__(self, n_heads: int = 4, head_dim: int = 64):
         super().__init__()
@@ -282,14 +270,7 @@ class TokenConfidence(nn.Module):
 
 
 class LightGlueNet(nn.Module):
-    """
-    LightGlue feature matcher matching the ETH CVG pretrained checkpoint layout:
-      posenc         — rotary positional encoding (Wr)
-      self_attn[i]   — per-image self-attention  (i = 0 … n_layers-1)
-      cross_attn[i]  — cross-image attention     (i = 0 … n_layers-1)
-      log_assignment[i] — per-layer score head   (i = 0 … n_layers-1)
-      token_confidence[i] — early-exit token     (i = 0 … n_layers-2)
-    """
+    """LightGlue feature matcher (ETH CVG checkpoint layout)."""
 
     def __init__(self, d_model: int = 256, n_layers: int = 9, n_heads: int = 4):
         super().__init__()
@@ -312,10 +293,8 @@ class LightGlueNet(nn.Module):
         kpt1:  torch.Tensor,   # (B, M, 2) normalised coords
     ) -> torch.Tensor:
         """Returns (B, N, M) assignment scores from the final layer."""
-        # Compute rotary frequencies — NOT added to descriptors,
-        # applied inside each self-attention block via _apply_rope.
-        freqs0 = self.posenc(kpt0)   # (B, N, head_dim//2)
-        freqs1 = self.posenc(kpt1)   # (B, M, head_dim//2)
+        freqs0 = self.posenc(kpt0)
+        freqs1 = self.posenc(kpt1)
         for sa, ca in zip(self.self_attn, self.cross_attn):
             desc0 = sa(desc0, freqs0)
             desc1 = sa(desc1, freqs1)
@@ -383,11 +362,7 @@ class LightGlueMatcher:
         kpt0 = torch.from_numpy(feat1.keypoints).float().unsqueeze(0).to(self.device)
         kpt1 = torch.from_numpy(feat2.keypoints).float().unsqueeze(0).to(self.device)
 
-        # ETH CVG LightGlue normalisation: centre on image, scale by max(H, W)/2.
-        # Both axes share the same scale so aspect ratio is preserved — this is
-        # what the pretrained checkpoint expects (Wr was trained on these coords).
-        # Using separate W/2 and H/2 scales corrupts the RoPE encoding for
-        # non-square images and kills match quality.
+        # Normalize: centre on image, scale by max(H,W)/2 (preserves aspect ratio for RoPE).
         kpt0 = kpt0.clone()
         scale0 = max(H1, W1) / 2.0
         kpt0[:, :, 0] = (kpt0[:, :, 0] - W1 / 2.0) / scale0
@@ -401,10 +376,8 @@ class LightGlueMatcher:
             scores = self.model(desc0, desc1, kpt0, kpt1)[0]  # (N, M)
             N = scores.shape[0]
 
-            # Mutual argmax on raw log-assignment scores.
-            # More stable than dual-softmax product: does not depend on N or M.
-            idx0 = scores.argmax(dim=1)          # (N,) best col for each row
-            idx1 = scores.argmax(dim=0)          # (M,) best row for each col
+            idx0 = scores.argmax(dim=1)  # (N,) best col for each row
+            idx1 = scores.argmax(dim=0)  # (M,) best row for each col
             arange = torch.arange(N, device=scores.device)
             mutual  = arange == idx1[idx0]        # True where i→j and j→i agree
             raw_val = scores[arange, idx0]
@@ -425,7 +398,7 @@ class LightGlueMatcher:
 
             result = MatchResult(matches=matches, match_scores=match_scores)
 
-            # Geometric verification — same F-matrix RANSAC as NNMatcher
+            # Geometric verification
             if len(matches) >= 8:
                 result = self._nn_matcher._verify_fundamental(feat1, feat2, result)
 

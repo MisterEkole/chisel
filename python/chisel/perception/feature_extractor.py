@@ -1,11 +1,4 @@
-"""
-chisel.perception.feature_extractor
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Learned and classical feature extraction for 3D reconstruction.
-
-SuperPoint: Self-Supervised Interest Point Detection and Description
-    (DeTone et al., CVPR 2018 Workshop)
-"""
+"""chisel.perception.feature_extractor — SuperPoint and SIFT feature extraction."""
 
 import torch
 import torch.nn as nn
@@ -113,12 +106,7 @@ class SuperPointNet(nn.Module):
         self.descriptor = SuperPointDescriptorHead(desc_dim)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            x: (B, 1, H, W) grayscale images, normalized to [0, 1]
-        Returns:
-            dict with 'scores_map' and 'descriptors_map'
-        """
+        """x: (B, 1, H, W) grayscale. Returns dict with 'scores_map' and 'descriptors_map'."""
         features = self.encoder(x)
         scores = self.detector(features)
         descriptors = self.descriptor(features)
@@ -130,13 +118,7 @@ class SuperPointNet(nn.Module):
 
 
 class SuperPointExtractor:
-    """
-    High-level SuperPoint feature extractor.
-
-    Usage:
-        extractor = SuperPointExtractor(max_keypoints=2048)
-        features = extractor.extract(image_bgr)
-    """
+    """SuperPoint feature extractor."""
 
     def __init__(
         self,
@@ -171,14 +153,7 @@ class SuperPointExtractor:
 
     @staticmethod
     def _remap_state_dict(state: dict) -> dict:
-        """
-        Remap MagicLeap pretrained keys to our nested module structure.
-
-        Pretrained layout          →  SuperPointNet layout
-        conv1a … conv4b            →  encoder.conv1a … encoder.conv4b
-        convPa, convPb             →  detector.conv,   detector.out
-        convDa, convDb             →  descriptor.conv, descriptor.out
-        """
+        """Remap MagicLeap pretrained keys to SuperPointNet layout."""
         key_map = {
             "conv1a": "encoder.conv1a", "conv1b": "encoder.conv1b",
             "conv2a": "encoder.conv2a", "conv2b": "encoder.conv2b",
@@ -212,15 +187,7 @@ class SuperPointExtractor:
 
     @torch.no_grad()
     def extract(self, image: np.ndarray) -> FeatureData:
-        """
-        Extract SuperPoint features from a single image.
-
-        Args:
-            image: (H, W, 3) BGR or (H, W) grayscale uint8
-
-        Returns:
-            FeatureData with keypoints, descriptors, scores
-        """
+        """Extract SuperPoint features. image: (H,W,3) BGR or (H,W) grayscale uint8."""
         H, W = image.shape[:2]
         inp = self._preprocess(image)
 
@@ -283,13 +250,7 @@ class SuperPointExtractor:
 
 
 class SIFTExtractor:
-    """
-    OpenCV SIFT feature extractor (classical baseline).
-
-    Usage:
-        extractor = SIFTExtractor(max_keypoints=4096)
-        features = extractor.extract(image_bgr)
-    """
+    """OpenCV SIFT feature extractor."""
 
     def __init__(
         self,
