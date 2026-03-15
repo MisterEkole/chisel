@@ -382,7 +382,7 @@ class ReconstructionPipeline:
                  features: Dict[int, FeatureData],
                  matches: Dict[tuple, MatchResult]) -> dict:
         """Incremental SfM: two-view init → PnP registration → triangulation → BA."""
-        import cv2
+
 
         _empty = {"num_registered": 0, "num_points": 0,
                   "points3d": np.zeros((0, 3)), "poses": {},
@@ -1022,7 +1022,7 @@ class ReconstructionPipeline:
 
     def _dense_sgbm(self, scene: ETH3DScene, sfm: dict, out: Path) -> np.ndarray:
         """OpenCV SGBM dense stereo: select pair, rectify, match, reproject."""
-        import cv2
+        
 
         registered = sfm.get("poses", {})
         if len(registered) < 2:
@@ -1130,7 +1130,7 @@ class ReconstructionPipeline:
 
     def _evaluate_depth(self, scene: ETH3DScene, sfm: dict) -> Optional[DepthMetrics]:
         """Evaluate monocular depth vs ETH3D GT (16-bit PNG, mm). Returns None if unavailable."""
-        import cv2
+       
 
         depth_dir = scene.path / "depth"
         if not depth_dir.exists() or self.depth_estimator is None:
